@@ -447,6 +447,392 @@ pub mod setpoint_weighting_examples {
     }
 }
 
+
+/// Smith-Predictor attempt for processes with dead time (time delays)
+pub struct SmithPredictor<const MODEL_ORDER: usize> {
+    pid: PidController,
+    
+    // Process model parameters (for delay-free part)
+    model_numerator: [f32; MODEL_ORDER],    // b0, b1, b2, ... 
+    model_denominator: [f32; MODEL_ORDER],  // a0, a1, a2, ... (a0 is usually 1.0) 
+    
+    // Time delay model (in samples)
+    delay_samples: usize,
+    
+    // Model state buffers
+    model_input_buffer: [f32; MODEL_ORDER],  // Past inputs u[k-1], u[k-2], ...
+    model_output_buffer: [f32; MODEL_ORDER], // Past model outputs y_m[k-1], y_m[k-2], ...
+    
+    // Delay buffer (FIFO queue for delayed model output)
+    delay_buffer: [f32; 256],  // Fixed-size buffer, adjust to your needs nerd!
+    delay_write_idx: usize,
+    delay_read_idx: usize,
+    
+    // State variables
+    previous_control_output: f32,
+    predicted_output: f32,
+    model_output: f32,
+    
+    // Configuration
+    model_enabled: bool,
+    adaptive_model: bool,
+    model_learning_rate: f32,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum SmithPredictorError {
+    InvalidDelay,
+    InvalidModelParameters,
+    BufferTooSmall,
+    ModelNotStable,
+}
+
+impl<const N: usize> SmithPredictor<N> {
+    /// Create a new Smith Predictor with given PID controller and process model
+    pub fn new(
+        pid: PidController,
+        model_numerator: [f32; N],
+        model_denominator: [f32; N],
+        delay_samples: usize,
+    ) -> Result<Self, SmithPredictorError> {
+        // Validate model parameters
+        if model_denominator[0] == 0.0 {
+            return Err(SmithPredictorError::InvalidModelParameters);
+        }
+        
+        // Check for model stability (simplified check)
+        let mut sum = 0.0;
+        for i in 0..N {
+            sum += model_denominator[i].abs(); //computes absolute value of self
+        }
+        if sum > 10.0 * N as f32 {  // Rough stability check
+            return Err(SmithPredictorError::ModelNotStable);
+        }
+        
+        if delay_samples >= 256 {  // Our buffer size
+            return Err(SmithPredictorError::BufferTooSmall);
+        }
+        
+        Ok(Self {
+            pid,
+            model_numerator,
+            model_denominator,
+            delay_samples,
+            model_input_buffer: [0.0; N],
+            model_output_buffer: [0.0; N],
+            delay_buffer: [0.0; 256],
+            delay_write_idx: 0,
+            delay_read_idx: delay_samples, // Read lags write by delay_samples
+            previous_control_output: 0.0,
+            predicted_output: 0.0,
+            model_output: 0.0,
+            model_enabled: true,
+            adaptive_model: false,
+            model_learning_rate: 0.001,
+        })
+    }
+    
+    /// Compute control output using Smith Predictor architecture, with setpoint & measurement
+    pub fn compute(&mut self, setpoint: f32, measurement: f32) -> f32 {
+        // 1. Compute the delay-free model output
+        self.model_output = self.compute_model_output(self.previous_control_output);
+        
+        // 2. Compute delayed model output (from buffer)
+        let delayed_model_output = self.get_delayed_model_output();
+        
+        // 3. Update delay buffer with current model output
+        self.update_delay_buffer(self.model_output);
+        
+        // 4. Compute model error (difference between real process and delayed model)
+        let model_error = measurement - delayed_model_output;
+        
+        // 5. Compute predicted present output (compensated for the delay)
+        self.predicted_output = self.model_output + model_error;
+        
+        // 6. Use PID to compute control output based on predicted output
+        let control_output = if self.model_enabled {
+            // Smith Predictor mode: PID sees predicted present output
+            self.pid.compute(setpoint, self.predicted_output)
+        } else {
+            // Fallback to regular PID (for testing or model failure)
+            self.pid.compute(setpoint, measurement)
+        };
+        
+        // 7. Store control output for next iteration
+        self.previous_control_output = control_output;
+        
+        // 8. Optional: adaptive model adjustment
+        if self.adaptive_model {
+            self.adapt_model(measurement, delayed_model_output, control_output);
+        }
+        
+        control_output
+    }
+    
+    /// Asynchronous version with proper timing
+    pub async fn compute_async(&mut self, setpoint: f32, measurement: f32) -> f32 {
+        let now = Instant::now();
+        
+        // Use the PID's timing logic
+        if let Some(last_time) = self.pid.last_time {
+            let elapsed = now.duration_since(last_time);
+            if elapsed < self.pid.sample_time {
+                Timer::after(self.pid.sample_time - elapsed).await;
+            }
+        }
+        
+        self.compute(setpoint, measurement)
+    }
+    
+    /// Compute the delay-free model output using difference equation
+    fn compute_model_output(&mut self, input: f32) -> f32 {
+        if !self.model_enabled {
+            return 0.0;
+        }
+        
+        // Shift input buffer
+        for i in (1..N).rev() { //reverse the iterator's direction
+            self.model_input_buffer[i] = self.model_input_buffer[i - 1];
+        }
+        self.model_input_buffer[0] = input;
+        
+        // Compute output using difference equation: TODO: Improve this later with less confusing arithmetic
+        //y[k] = (b0*u[k] + b1*u[k-1] + ...) - (a1*y[k-1] + a2*y[k-2] + ...)
+
+        let mut output = 0.0; //simple
+        
+        // Numerator terms (b coefficients with input)
+        for i in 0..N {
+            output += self.model_numerator[i] * self.model_input_buffer[i];
+        }
+        
+        // Denominator terms (a coefficients with past outputs, a0 is assumed 1)
+        for i in 1..N {
+            output -= self.model_denominator[i] * self.model_output_buffer[i - 1];
+        }
+        
+        // Normalize by a0 (which should be 1.0 for proper form)
+        if self.model_denominator[0] != 0.0 {
+            output /= self.model_denominator[0];
+        }
+        
+        // Shift output buffer
+        for i in (1..N).rev() {
+            self.model_output_buffer[i] = self.model_output_buffer[i - 1];
+        }
+        self.model_output_buffer[0] = output;
+        
+        output
+    }
+    
+    /// Get the delayed model output from buffer
+    fn get_delayed_model_output(&self) -> f32 {
+        if !self.model_enabled || self.delay_samples == 0 {
+            return self.model_output;
+        }
+        
+        self.delay_buffer[self.delay_read_idx]
+    }
+    
+    /// Update the delay buffer with new model output
+    fn update_delay_buffer(&mut self, new_output: f32) {
+        if self.delay_samples == 0 {
+            return;
+        }
+        
+        // Write new value
+        self.delay_buffer[self.delay_write_idx] = new_output;
+        
+        // Update indices with wrap-around
+        self.delay_write_idx = (self.delay_write_idx + 1) % 256;
+        self.delay_read_idx = (self.delay_read_idx + 1) % 256;
+    }
+    
+    /// Simple adaptive model adjustment attempt (LMS-like algorithm). Haha!
+    fn adapt_model(&mut self, actual_output: f32, predicted_output: f32, _control_input: f32) {
+        let error = actual_output - predicted_output;
+        
+        // Adjust model parameters (simplified gradient descent)
+        // This is a simplified version - a real implementation would need more sophistication (<_>)
+        for i in 0..N {
+            if i < self.model_input_buffer.len() {
+                // Adjust numerator coefficients based on input contribution
+                let gradient = self.model_input_buffer[i] * error;
+                self.model_numerator[i] += self.model_learning_rate * gradient;
+            }
+            
+            if i > 0 && i - 1 < self.model_output_buffer.len() {
+                // Adjust denominator coefficients (except a0)
+                let gradient = self.model_output_buffer[i - 1] * error;
+                self.model_denominator[i] += self.model_learning_rate * gradient;
+            }
+        }
+        
+        // Ensure a0 stays at 1.0 (standard form)
+        if self.model_denominator[0] != 1.0 {
+            // Normalize all coefficients
+            let a0 = self.model_denominator[0];
+            for coeff in self.model_denominator.iter_mut() { //return the mutable iterator to modify each value
+                *coeff /= a0;
+            }
+            for coeff in self.model_numerator.iter_mut() {
+                *coeff /= a0; //divides the left operand by the right operand and assigns the result back to the left operand
+                //just like x = x / y
+            }
+            self.model_denominator[0] = 1.0;
+        }
+    }
+    
+    /// Enable/disable Smith Predictor (fallback to regular PID)
+    pub fn enable_model(&mut self, enabled: bool) {
+        self.model_enabled = enabled;
+        
+        if enabled {
+            // Reset model state when enabling
+            self.model_input_buffer = [0.0; N];
+            self.model_output_buffer = [0.0; N];
+            self.delay_buffer = [0.0; 256];
+            self.delay_write_idx = 0;
+            self.delay_read_idx = self.delay_samples;
+            self.previous_control_output = 0.0;
+        }
+    }
+    
+    /// Enable/disable adaptive model adjustment because my adptation algorithm is too basic
+    pub fn enable_adaptation(&mut self, enabled: bool) {
+        self.adaptive_model = enabled;
+    }
+    
+    /// Set model learning rate for adaptation
+    pub fn set_learning_rate(&mut self, rate: f32) -> Result<(), SmithPredictorError> {
+        if rate <= 0.0 || rate > 1.0 || rate.is_nan() || rate.is_infinite() {
+            return Err(SmithPredictorError::InvalidModelParameters);
+        }
+        self.model_learning_rate = rate;
+        Ok(())
+    }
+    
+    /// Get current model parameters
+    pub fn get_model_parameters(&self) -> ([f32; N], [f32; N]) {
+        (self.model_numerator, self.model_denominator)
+    }
+    
+    /// Get predicted output (for monitoring/debugging)
+    pub fn get_predicted_output(&self) -> f32 {
+        self.predicted_output
+    }
+    
+    /// Get model output (for monitoring/debugging)
+    pub fn get_model_output(&self) -> f32 {
+        self.model_output
+    }
+    
+    /// Reset the Smith Predictor state
+    pub fn reset(&mut self) {
+        self.pid.reset();
+        self.model_input_buffer = [0.0; N];
+        self.model_output_buffer = [0.0; N];
+        self.delay_buffer = [0.0; 256];
+        self.delay_write_idx = 0;
+        self.delay_read_idx = self.delay_samples;
+        self.previous_control_output = 0.0;
+        self.predicted_output = 0.0;
+        self.model_output = 0.0;
+    }
+    
+    /// Get reference to internal PID controller for tuning
+    pub fn pid_mut(&mut self) -> &mut PidController {
+        &mut self.pid
+    }
+    
+    /// Get immutable reference to internal PID controller. Might be useful
+    pub fn pid(&self) -> &PidController {
+        &self.pid
+    }
+}
+
+/// Helper functions for creating common process models
+pub mod smith_models {
+    //use super::*;
+    
+    /// Create a first-order plus time delay (FOPTD) model
+    /// K: process gain, tau: time constant, theta: time delay (in samples)
+    pub fn create_foptd_model<const N: usize>(
+        k: f32, 
+        tau: f32, 
+        _theta_samples: usize
+    ) -> ([f32; N], [f32; N]) {
+        // First-order discrete model: y[k] = a*y[k-1] + b*u[k-1]
+        // where a = exp(-dt/tau), b = K*(1 - a)
+        // Using N=2 for first-order model
+        
+        assert!(N >= 2, "First-order model requires N >= 2");
+        
+        let dt = 1.0; // Assuming unit sampling time for normalization
+    let a = libm::expf(-dt / tau);
+        let b = k * (1.0 - a);
+        
+        let mut numerator = [0.0; N];
+        let mut denominator = [0.0; N];
+        
+        // b0 = 0, b1 = b (one sample delay)
+        numerator[1] = b;
+        
+        // a0 = 1, a1 = -a
+        denominator[0] = 1.0;
+        denominator[1] = -a;
+        
+        (numerator, denominator)
+    }
+    
+    /// Create a second-order plus time delay (SOPTD) model...needs some improvement
+    pub fn create_soptd_model<const N: usize>(
+        k: f32,
+        tau1: f32,
+        tau2: f32,
+        _theta_samples: usize
+    ) -> ([f32; N], [f32; N]) {
+        // Second-order discrete model
+        assert!(N >= 3, "Second-order model requires N >= 3");
+        
+        let dt = 1.0;
+        let a1 = libm::expf(-dt / tau1);
+        let a2 = libm::expf(-dt / tau2);
+        
+        // Simplified coefficients - TODO: improve to use proper discretization
+        let mut numerator = [0.0; N];
+        let mut denominator = [0.0; N];
+        
+        numerator[2] = k * (1.0 - a1) * (1.0 - a2);
+        denominator[0] = 1.0;
+        denominator[1] = -(a1 + a2);
+        denominator[2] = a1 * a2;
+        
+        (numerator, denominator)
+    }
+    
+    /// Create an integrator plus time delay model
+    pub fn create_integrator_model<const N: usize>(
+        k: f32,
+        _theta_samples: usize
+    ) -> ([f32; N], [f32; N]) {
+        // Integrator: y[k] = y[k-1] + K*u[k-1]*dt
+        assert!(N >= 2, "Integrator model requires N >= 2");
+        
+        let dt = 1.0;
+        let mut numerator = [0.0; N];
+        let mut denominator = [0.0; N];
+        
+        numerator[1] = k * dt;
+        denominator[0] = 1.0;
+        denominator[1] = -1.0; // y[k-1] coefficient
+        
+        (numerator, denominator)
+    }
+}
+
+
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -505,3 +891,94 @@ mod tests {
         assert!(output < 50.0);
     }
 }
+
+///Smith-Predictor tests
+#[cfg(test)]
+mod smith_tests {
+    use super::*;
+    use embassy_time::Duration;
+    
+    #[test]
+    fn test_smith_predictor_creation() {
+        // Create a PID controller
+        let pid = PidController::new(1.0, 0.1, 0.05)
+            .unwrap()
+            .with_output_limits(-10.0, 10.0)
+            .unwrap()
+            .with_sample_time(Duration::from_millis(10))
+            .unwrap();
+        
+        // Create a first-order model (K=1.0, tau=2.0)
+        let (num, den) = smith_models::create_foptd_model::<2>(1.0, 2.0, 5);
+        
+        // Create Smith Predictor with 5 samples delay
+        let smith = SmithPredictor::new(pid, num, den, 5);
+        
+        assert!(smith.is_ok());
+    }
+    
+    #[test]
+    fn test_smith_predictor_computation() {
+        let pid = PidController::new(2.0, 0.2, 0.1)
+            .unwrap()
+            .with_output_limits(-5.0, 5.0)
+            .unwrap();
+        
+        // Simple gain model: y[k] = 0.5*u[k-1]
+        let numerator = [0.0, 0.5];  // b0=0, b1=0.5
+        let denominator = [1.0, 0.0]; // a0=1, a1=0
+        
+        let mut smith = SmithPredictor::new(pid, numerator, denominator, 3)
+            .unwrap();
+        
+        // Test computation
+        let output = smith.compute(100.0, 0.0);
+        
+        // First computation should produce some output
+        assert!(output.abs() > 0.0);
+        
+        // Model should be enabled by default
+        assert!(smith.model_enabled);
+    }
+    
+    #[test]
+    fn test_model_enable_disable() {
+        let pid = PidController::new(1.0, 0.1, 0.01).unwrap();
+        let (num, den) = smith_models::create_foptd_model::<2>(1.0, 1.0, 2);
+        
+        let mut smith = SmithPredictor::new(pid, num, den, 2).unwrap();
+        
+        // Initially enabled
+        assert!(smith.model_enabled);
+        
+        // Disable - should fall back to regular PID
+        smith.enable_model(false);
+        assert!(!smith.model_enabled);
+        
+        // Re-enable
+        smith.enable_model(true);
+        assert!(smith.model_enabled);
+    }
+    
+    #[test]
+    fn test_smith_predictor_reset() {
+        let pid = PidController::new(1.0, 0.1, 0.01).unwrap();
+        let (num, den) = smith_models::create_foptd_model::<2>(1.0, 1.0, 2);
+        
+        let mut smith = SmithPredictor::new(pid, num, den, 2).unwrap();
+        
+        // Do some computations
+        smith.compute(50.0, 0.0);
+        smith.compute(50.0, 10.0);
+        
+        // Reset
+        smith.reset();
+        
+        // After reset, internal buffers should be cleared
+        // (This is mostly to ensure no panic on reset)
+        let output = smith.compute(50.0, 0.0);
+        assert!(output.is_finite());
+    }
+}
+
+//TODO: Do more sensible tests!
