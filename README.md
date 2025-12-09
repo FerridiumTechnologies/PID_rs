@@ -1,6 +1,7 @@
 ## PID_rs
 
 What is this?! A no_std PID controller implementation in Rust for embedded systems.
+STILL UNDER DEVELOPMENT
 
 This crate implements a full-featured, small-footprint PID controller that runs in a `#![no_std]` environment. It provides:
 
@@ -48,8 +49,66 @@ You can specify output limits and integral limits. When the computed controller 
 
 Anti-windup mode in this crate is "clamping": if the raw output would be outside limits the integral term is recomputed so the final clamped output equals the sum of P, I and D terms without further windup.
 
+### Smith Predictor. Tuning more aggressively!!
+There are limitations of PI control for processes with long dead time. In many real-world processes (like chemical reactors, distillation columns, or temperature control in large systems), there's a significant delay between when a control action is applied (e.g., opening a valve) and when its effect is measured at the output. A standard PID controller reacts to the past error, often leading to:
 
-Example usage (synchronous):
+  - Slow and sluggish response
+  - Overshoot and instability
+  - Very conservative tuning (low gains) to maintain stability, which degrades  performance.
+
+A Smith Predictor is used to handle the processes with significant time delays (dead time). It's a model based predictor-controller that 'predicts' the effort of effect to the control action on the process output, this allows better performance than the standard feedback controller when delays are present.
+
+Process Modelling:
+  - Supports N-th order difference equation models
+  - Includes time delay buffer (FIFO) to simulate process delays
+  - Provides helper functions for common models (FOPTD, SOPTD, integrator)
+
+### FOPTD and SOPTD
+Both are standard model structures used in process control to approximate real-world dynamic systems with time delays.
+FOPTD (First-Order Plus Time Delay) also called "first-order lag with dead time"
+![TF](image.png)
+  K  = Process gain (steady-state gain)
+  τ  = Time constant (speed of response)
+  θ  = Time delay (dead time)
+Step response: Shows a delay (θ), then exponential approach to final value
+
+SOPTD (Second-Order Plus Time Delay)
+Read here: [Optimal PID Tuning with FOPTD and SOPTD](https://www.researchgate.net/publication/222402204_Optimal_tuning_of_PID_controllers_for_FOPTD_SOPTD_and_SOPTD_with_lead_processes)
+
+Core Algorithm of Smith-Predictor:
+
+  - Computes delay-free model output
+  - Compares delayed model output with actual measurement
+  - Predicts "present" output by adding model error
+  - PID controller acts on the predicted output instead of delayed measurement. Huh!
+
+![Smith block diagram](image-1.png)
+
+Math is done using Rust implementations of the C math library [libm](https://crates.io/crates/libm)
+
+Example Usage:
+```rust
+// Create a PID controller with gains kp, ki, kd
+let pid = PidController::new(2.0, 0.1, 0.5)?;
+
+// Create a first-order model with delay
+let (num, den) = smith_models::create_foptd_model::<2>(1.0, 5.0, 10);
+
+// Create Smith Predictor with 10 samples delay
+let mut smith = SmithPredictor::new(pid, num, den, 10)?;
+
+// Use in control loop
+let control_output = smith.compute(setpoint, measurement);
+```
+
+References:
+1. [Mathworks Smith-Predictor](https://www.mathworks.com/help/control/ug/control-of-processes-with-long-dead-time-the-smith-predictor.html)
+2. [How to approximate FOPTD](https://www.mathworks.com/matlabcentral/answers/2093891-how-approximate-model-fopdt)
+3. [some math on FOPDT](https://apmonitor.com/pdc/index.php/Main/FirstOrderSystems)
+
+
+
+Example PID usages without Smith-predictor (synchronous):
 
 ```rust
 use pid_rs::PidController;
@@ -71,7 +130,7 @@ let output = pid.compute(setpoint, measurement);
 // send `output` to actuator
 ```
 
-Example usage (async) using `embassy_time` for correct timing between samples:
+(async) using `embassy_time` for correct timing between samples:
 
 ```rust
 use pid_rs::PidController;
@@ -109,6 +168,10 @@ async fn main(spawner: embassy_executor::Spawner) {
   - `with_derivative_filter(time_constant)`
   - `with_anti_windup(bool)`
 
+  -`create_foptd_model(N)`
+  -`create_soptd_model(N)`
+  -`create_integrator_model(N)`
+
 - Control methods:
   - `compute(setpoint, measurement) -> f32` (synchronous)
   - `compute_async(setpoint, measurement) -> f32` (async with timing)
@@ -128,6 +191,8 @@ There are unit tests in `src/lib.rs` that exercise setpoint weighting behaviour 
 ```bash
 cargo test -v
 ```
+## Known issues
+`cargo build` is successful but `cargo test --verbose` fails with: `Linking with cc failed!` Too lazy to start poking at linker errors for now...
 
 ## Contribution
 
@@ -140,7 +205,8 @@ Contributions are welcome:
 I will really appreciate
 
 # Future Works
-Complete examples showing how to use `pid_rs` with real world MCUs and sensors/actuators.
+Complete examples showing how to use `pid_rs` with real world MCUs and sensors/actuators/plants.
+Use `defmt` to print messages.
 
 ## License
 
